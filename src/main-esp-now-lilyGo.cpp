@@ -7,6 +7,9 @@
 #include <Adafruit_SSD1306.h>
 #include "SharedPayload.h" 
 
+// config
+#include "secrets.h"
+
 // --- LoRa & OLED Pins ---
 #define SCK 5
 #define MISO 19
@@ -16,9 +19,13 @@
 #define DIO0 26
 #define OLED_SDA 21
 #define OLED_SCL 22
-#define LORA_BAND 915E6
+#define LORA_BAND SECRET_LORA_BAND
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+// --- Interrupt-Safe Variables ---
+volatile bool hasNewDataToRelay = false;
+Payload pendingPayload;
 
 // --- Display Helper ---
 void updateScreen(String title, String line1, String line2) {
@@ -32,26 +39,64 @@ void updateScreen(String title, String line1, String line2) {
 }
 
 // --- ESP-NOW Callback ---
+// This function only handles "receiving", not "sending" or "waiting"
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-    // 1. Strict size validation
     if(len != sizeof(Payload)) {
         Serial.println("[Error] Payload size mismatch!");
         return;
     }
+    // Copy data to global variable and set a flag to notify loop() to process it
+    memcpy((uint8_t*)&pendingPayload, incomingData, sizeof(pendingPayload));
+    hasNewDataToRelay = true; 
+}
 
-    // 2. Map binary data to struct
-    Payload payload;
-    memcpy(&payload, incomingData, sizeof(payload));
+// --- Core Logic for LoRa Transmission and Waiting for ACK ---
+bool sendLoRaWithAck(Payload data) {
+    int maxRetries = 3;             // Maximum number of retries
+    unsigned long timeoutMs = 1500; // Timeout for waiting for ACK (1.5 seconds)
 
-    Serial.printf("[ESP-NOW] Rx | UID: %d | SEQ: %d\n", payload.uid, payload.seq);
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        Serial.printf("\n[LoRa] Tx Attempt %d/%d | UID: %d | SEQ: %d\n", attempt, maxRetries, data.uid, data.seq);
+        
+        // 1. Send data
+        LoRa.beginPacket();
+        LoRa.write((uint8_t*)&data, sizeof(data));
+        LoRa.endPacket();
 
-    // 3. Forward exact binary via LoRa
-    LoRa.beginPacket();
-    LoRa.write((uint8_t*)&payload, sizeof(payload));
-    LoRa.endPacket();
+        // 2. Immediately switch to receive mode, prepare to listen for Gateway's ACK
+        LoRa.receive(); 
+        
+        unsigned long startTime = millis();
+        bool ackReceived = false;
 
-    Serial.printf("[LoRa] Tx | Size: %d | RSSI: %d\n", sizeof(payload), LoRa.packetRssi());
-    updateScreen("RELAY ACTIVE", "UID: " + String(payload.uid), "SEQ: " + String(payload.seq));
+        // 3. Continuously check for received packets within the Timeout period
+        while (millis() - startTime < timeoutMs) {
+            int packetSize = LoRa.parsePacket();
+            
+            if (packetSize == sizeof(AckPayload)) {
+                AckPayload ack;
+                LoRa.readBytes((uint8_t*)&ack, sizeof(ack));
+                
+                // Check if this ACK is for the data we just sent
+                if (ack.uid == data.uid && ack.seq == data.seq) {
+                    ackReceived = true;
+                    break; // Successfully received, exit the waiting loop
+                }
+            }
+        }
+
+        // 4. Evaluate the result
+        if (ackReceived) {
+            Serial.println("[LoRa] TX SUCCESS: ACK Received!");
+            return true; // Mission accomplished
+        } else {
+            Serial.println("[LoRa] TX FAILED: ACK Timeout.");
+            delay(500); // Wait briefly before retrying to avoid band congestion
+        }
+    }
+
+    Serial.println("[LoRa] TX CRITICAL: Max retries reached. Data dropped.");
+    return false;
 }
 
 void setup() {
@@ -88,4 +133,19 @@ void setup() {
 }
 
 void loop() {
+    // Triggered when ESP-NOW receives new data
+    if (hasNewDataToRelay) {
+        hasNewDataToRelay = false; // Reset the flag
+        
+        updateScreen("RELAYING...", "UID: " + String(pendingPayload.uid), "SEQ: " + String(pendingPayload.seq));
+        
+        // Execute transmission and retry logic
+        bool success = sendLoRaWithAck(pendingPayload);
+        
+        if (success) {
+            updateScreen("RELAY SUCCESS", "UID: " + String(pendingPayload.uid), "ACK Received");
+        } else {
+            updateScreen("RELAY FAILED", "UID: " + String(pendingPayload.uid), "Timeout Dropped");
+        }
+    }
 }

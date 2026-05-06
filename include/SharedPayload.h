@@ -13,6 +13,11 @@ struct Payload {
     uint8_t community_id;   // 1 byte: Community code
     uint8_t unit_id;        // 1 byte: Unit code
 }; 
+
+struct AckPayload {
+    uint32_t uid;
+    uint32_t seq;
+};
 #pragma pack(pop)
 
 #endif 

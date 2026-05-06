@@ -3,11 +3,14 @@
 #include <esp_now.h>
 #include "SharedPayload.h"
 
+// config
+#include "secrets.h"
+
 // ==========================================
 // 1. Substation (LilyGo) MAC Address
 // ==========================================
 // Replace with the actual MAC address of your LilyGo Substation
-uint8_t broadcastAddress[] = {0xF0, 0x24, 0xF9, 0x93, 0x8F, 0x24}; 
+uint8_t broadcastAddress[] = SECRET_MAC; 
 
 // Map "MINI-002" to an integer UID to save bandwidth
 const uint32_t DEVICE_UID = 2; 
