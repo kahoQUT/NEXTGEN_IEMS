@@ -149,8 +149,12 @@ void setup() {
   // 6. Power down and go to sleep
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  esp_sleep_enable_timer_wakeup(SLEEP_TIME_SEC * 1000000ULL);
-  esp_deep_sleep_start();
+//   esp_sleep_enable_timer_wakeup(SLEEP_TIME_SEC * 1000000ULL);
+//   esp_deep_sleep_start();
+  Serial.println("Dev Mode: Keeping USB alive. Waiting...");
+  delay(SLEEP_TIME_SEC * 1000);
+  ESP.restart();
+
 }
 
 void loop() {

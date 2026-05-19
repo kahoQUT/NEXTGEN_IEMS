@@ -58,11 +58,23 @@ void updateScreen(String title, String line1, String line2) {
 void setup_wifi() {
     delay(10);
     WiFi.begin(ssid, password);
+    int counter = 0;
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        counter++;
+        if(counter > 20) { 
+            Serial.println("\n[WiFi] Connect Timeout! Retrying...");
+            break;
+        }
     }
-    Serial.println("\n[WiFi] Connected!");
+    if(WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[WiFi] Connected!");
+        IPAddress dns(8, 8, 8, 8);
+        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns);
+        Serial.println("[WiFi] DNS forced to 8.8.8.8");
+     
+    }
 }
 
 void reconnect_mqtt() {
@@ -106,43 +118,46 @@ void onLoRaReceive(int packetSize) {
 // --- Initialization ---
 void setup() {
     Serial.begin(115200);
-    delay(5000);
+    for(int i = 3; i > 0; i--) {
+        Serial.printf("[System] Starting in %d...\n", i);
+        delay(1000);
+    }
+
+    Serial.println("\n--- Gateway Substation Booting ---");
+
 
     Wire.begin(OLED_SDA, OLED_SCL);
-    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
-    updateScreen("GATEWAY", "Booting...", "");
+    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        display.setTextSize(1);
+        display.setTextColor(WHITE);
+        updateScreen("GATEWAY", "Booting...", "");
+        Serial.println("[System] OLED Initialized.");
+    }
 
     if (ENABLE_MQTT) {
         setup_wifi();
         client.setServer(mqtt_server, mqtt_port);
     } else {
-        Serial.println("[System] MQTT & WiFi is DISABLED. LoRa Rx Test Mode Only");
+        Serial.println("[System] MQTT & WiFi is DISABLED.");
     }
 
     SPI.begin(SCK, MISO, MOSI, SS);
     LoRa.setPins(SS, RST, DIO0);
     if (!LoRa.begin(LORA_BAND)) {
         updateScreen("ERROR", "LoRa Init Failed", "");
-        Serial.println("[System Error] LoRa Initialization Failed!");
+        Serial.println("[Critical Error] LoRa Initialization Failed!");
         while (1);
     }
-    
-    // LoRa Configuration (Must match Substation exactly)
     LoRa.setSpreadingFactor(10);
     LoRa.setSignalBandwidth(125E3);
     LoRa.setSyncWord(0xF3);
     LoRa.enableCrc();
-    LoRa.setTxPower(14); // Required for sending ACKs
+    LoRa.setTxPower(14);
 
-    LoRa.onReceive(onLoRaReceive);
-    LoRa.receive();
 
-    if (!ENABLE_MQTT) {
-        updateScreen("TEST MODE", "LoRa Rx Only", "MQTT Offline");
-        Serial.println("[System] Gateway Ready. Waiting for LoRa...");
-    }
+    Serial.println("[System] Gateway Ready. Mode: Polling Loop.");
+    updateScreen("GATEWAY", "Ready", "Listening LoRa...");
+    Serial.println("----------------------------------------------");
 }
 
 // --- Main Loop ---
@@ -155,67 +170,64 @@ void loop() {
         client.loop(); 
     }
 
-    // 2. DEBUG: Handle LoRa Packet Size Error Safely
-    if (sizeMismatchError) {
-        sizeMismatchError = false; 
-        Serial.println("\n[DEBUG - LORA RX ERROR] ======================");
-        Serial.printf("=> Packet Size Mismatch!\n");
-        Serial.printf("=> Expected: %d bytes | Received: %d bytes\n", sizeof(Payload), errorPacketSize);
-        Serial.println("==============================================\n");
-        
-        updateScreen("RX ERROR", "Size Mismatch", "Got: " + String(errorPacketSize) + "B");
-        LoRa.receive(); 
-    }
+    // 【關鍵修改 6】安全的安全輪詢邏輯 (取代原本的中斷)
+    int packetSize = LoRa.parsePacket();
+    
+    if (packetSize > 0) {
+        if (packetSize == sizeof(Payload)) {
+            // 收到正確大小的資料封包
+            LoRa.readBytes((uint8_t*)&globalPayload, sizeof(globalPayload));
+            int rssi = LoRa.packetRssi();
+            float snr = LoRa.packetSnr();
 
-    // 3. Process Successful LoRa Packet
-    if (newLoRaPacket) {
-        newLoRaPacket = false; 
+            Serial.println("\n[LoRa RX] <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
+            Serial.printf("=> Packet Size: %d Bytes | RSSI: %d dBm | SNR: %.1f dB\n", packetSize, rssi, snr);
+            Serial.printf("=> Parsed Data -> UID: %u | SEQ: %u | Volt: %.1fV\n", globalPayload.uid, globalPayload.seq, globalPayload.voltage);
 
-        // --- SECTION A: LORA RECEIVE DEBUG ---
-        Serial.println("\n[DEBUG - LORA RX] <<<<<<<<<<<<<<<<<<<<<<<<<<<<");
-        Serial.printf("=> LoRa Packet Received!\n");
-        Serial.printf("=> Size: %d Bytes | RSSI: %d dBm | SNR: %.1f dB\n", globalPacketSize, globalRssi, globalSnr);
-        Serial.printf("=> Parsed Data -> UID: %u | SEQ: %u\n", globalPayload.uid, globalPayload.seq);
+            updateScreen("LORA RX OK", "UID: " + String(globalPayload.uid), "RSSI: " + String(rssi));
 
-        updateScreen("LORA RX OK", "UID: " + String(globalPayload.uid), "RSSI: " + String(globalRssi));
 
-        // --- SECTION B: IMMEDIATELY SEND ACK ---
-        AckPayload ack;
-        ack.uid = globalPayload.uid;
-        ack.seq = globalPayload.seq;
+            AckPayload ack;
+            ack.uid = globalPayload.uid;
+            ack.seq = globalPayload.seq;
 
-        Serial.println("[DEBUG - LORA TX] >>>>>>>>>>>>>>>>>>>>>>>>>>>>");
-        Serial.printf("=> Sending ACK for UID: %u | SEQ: %u\n", ack.uid, ack.seq);
-        
-        LoRa.beginPacket();
-        LoRa.write((uint8_t*)&ack, sizeof(ack));
-        LoRa.endPacket();
-        
-        Serial.println("=> ACK Sent Successfully!");
+            Serial.println("[LoRa TX ACK] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+            Serial.printf("=> Sending ACK for UID: %u | SEQ: %u\n", ack.uid, ack.seq);
+            
 
-        // --- SECTION C: MQTT FORWARDING ---
-        if (ENABLE_MQTT) {
-            if (client.connected()) {
-                Serial.println("[DEBUG - MQTT TX] >>>>>>>>>>>>>>>>>>>>>>>>>>>>");
-                Serial.printf("=> Publishing to Topic: %s\n", mqtt_topic);
-                
+            delay(10); 
+            LoRa.beginPacket();
+            LoRa.write((uint8_t*)&ack, sizeof(ack));
+            LoRa.endPacket();
+            
+            Serial.println("=> ACK Sent Successfully!");
+
+   
+            if (ENABLE_MQTT && client.connected()) {
+                Serial.println("[MQTT TX] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
                 bool pubSuccess = client.publish(mqtt_topic, (const uint8_t*)&globalPayload, sizeof(globalPayload));
-                
                 if (pubSuccess) {
-                    Serial.println("=> Result: SUCCESS! Binary payload sent to Broker.");
+                    Serial.println("=> MQTT Publish SUCCESS!");
                     updateScreen("DATA FWD", "UID: " + String(globalPayload.uid), "Pub: SUCCESS");
                 } else {
-                    Serial.println("=> Result: FAILED! Payload exceeded limits or connection dropped.");
+                    Serial.println("=> MQTT Publish FAILED!");
                     updateScreen("DATA FWD", "UID: " + String(globalPayload.uid), "Pub: FAILED");
                 }
-            } else {
-                Serial.println("[DEBUG - MQTT TX] Warning: Cannot publish, MQTT is disconnected.");
             }
-        }
-        Serial.println("----------------------------------------------");
+            Serial.println("----------------------------------------------");
+            
+        } 
+        else if (packetSize == sizeof(AckPayload)) {
         
-        // --- SECTION D: RESUME LISTENING ---
-        // Ensure radio goes back to listening mode after all processing is done
-        LoRa.receive(); 
+        } 
+        else {
+
+            Serial.println("\n[LoRa RX ERROR] ==============================");
+            Serial.printf("=> Packet Size Mismatch! Expected: %d | Got: %d\n", sizeof(Payload), packetSize);
+            Serial.println("==============================================\n");
+            updateScreen("RX ERROR", "Size Mismatch", "Got: " + String(packetSize) + "B");
+        }
     }
+
+    delay(1); 
 }
