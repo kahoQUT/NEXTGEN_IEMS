@@ -1,0 +1,425 @@
+/**
+ * @file
+ * Tests for the NVS config readers, every node's loader and the sequence
+ * counter, run in QEMU against its emulated flash. Includes how each behaves
+ * on a never written partition and when NVS is unavailable.
+ *
+ * Every run boots a freshly merged flash image, so NVS starts empty. setUp()
+ * also wipes both namespaces, so each test starts from defaults.
+ */
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include <nvs_flash.h>
+#include <unity.h>
+
+#include <cstdlib>
+
+#include "nvs_config.h"
+#include "nvs_read.h"
+#include "secrets.h"
+#include "seq_counter.h"
+
+namespace {
+
+/** Namespace seq_counter.cpp keeps the counter in. */
+const char *RUNTIME_NAMESPACE = "runtime";
+/** Key seq_counter.cpp keeps the counter under. */
+const char *SEQ_KEY = "seq";
+
+/**
+ * Wipes one NVS namespace.
+ *
+ * @param[in] ns  Namespace to wipe.
+ */
+void clearNamespace(const char *ns) {
+  Preferences p;
+  p.begin(ns, false);
+  p.clear();
+  p.end();
+}
+
+/**
+ * Overwrites the stored sequence number behind seq_counter's back.
+ *
+ * @param[in] value  Value to store.
+ */
+void storeSeq(uint32_t value) {
+  Preferences p;
+  p.begin(RUNTIME_NAMESPACE, false);
+  p.putUInt(SEQ_KEY, value);
+  p.end();
+}
+
+/**
+ * Reads the stored sequence number with a separate handle.
+ *
+ * @return The stored value, or 0 if it was never set.
+ */
+uint32_t storedSeq() {
+  Preferences p;
+  p.begin(RUNTIME_NAMESPACE, true);
+  uint32_t value = p.getUInt(SEQ_KEY, 0);
+  p.end();
+  return value;
+}
+
+/**
+ * Takes NVS down, so every open fails as it would with a missing or
+ * uninitialised partition. Closes the shared handle first. Undo with nvsUp().
+ */
+void nvsDown() {
+  prefs.end();
+  TEST_ASSERT_EQUAL_INT(ESP_OK, nvs_flash_deinit());
+}
+
+/** Brings NVS back after nvsDown(), and reopens the shared handle for tearDown(). */
+void nvsUp() {
+  TEST_ASSERT_EQUAL_INT(ESP_OK, nvs_flash_init());
+  prefs.begin(NVS_NAMESPACE, false);
+}
+
+}  // namespace
+
+/** Wipes NVS and opens the shared config handle for writing. */
+void setUp() {
+  clearNamespace(NVS_NAMESPACE);
+  clearNamespace(RUNTIME_NAMESPACE);
+  prefs.begin(NVS_NAMESPACE, false);
+}
+
+/** Closes the shared config handle. */
+void tearDown() {
+  prefs.end();
+}
+
+/**
+ * @defgroup test_qemu_nvs NVS config
+ * @ingroup tests
+ * Tests in test_qemu_nvs/test_main.cpp.
+ * @{
+ */
+
+/** A number written to NVS reads back. */
+void test_read_u32_written_key() {
+  prefs.putUInt("poll_ms", 5000);
+  TEST_ASSERT_EQUAL_UINT32(5000, readU32("poll_ms", 1000));
+}
+
+/** An unset number gives the default. */
+void test_read_u32_unset_key_gives_default() {
+  TEST_ASSERT_EQUAL_UINT32(1000, readU32("poll_ms", 1000));
+}
+
+/** A string written to NVS reads back. */
+void test_read_str_written_key() {
+  prefs.putString("ap_ssid", "Kaizen");
+  char out[16];
+  readStr("ap_ssid", "Default", out, sizeof(out));
+  TEST_ASSERT_EQUAL_STRING("Kaizen", out);
+}
+
+/** An unset string gives the default. */
+void test_read_str_unset_key_gives_default() {
+  char out[16];
+  readStr("ap_ssid", "Default", out, sizeof(out));
+  TEST_ASSERT_EQUAL_STRING("Default", out);
+}
+
+/** A string longer than the buffer is truncated and still terminated. */
+void test_read_str_truncates() {
+  prefs.putString("ap_ssid", "KaizenNetwork");
+  char out[7];
+  readStr("ap_ssid", "Default", out, sizeof(out));
+  TEST_ASSERT_EQUAL_STRING("Kaizen", out);
+}
+
+/** The substation loader uses a value set in NVS, and the default otherwise. */
+void test_substation_loader_reads_nvs() {
+  SubstationConfig cfg;
+  prefs.end();
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadSubstationConfig(cfg));
+  TEST_ASSERT_EQUAL_UINT8(6, cfg.espNowChannel);
+  TEST_ASSERT_EQUAL_UINT32(100, cfg.espNowTimeoutMs);
+
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putUInt("espnow_chan", 11);
+  prefs.putUInt("espnow_to_ms", 250);
+  prefs.end();
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadSubstationConfig(cfg));
+  TEST_ASSERT_EQUAL_UINT8(11, cfg.espNowChannel);
+  TEST_ASSERT_EQUAL_UINT32(250, cfg.espNowTimeoutMs);
+  prefs.begin(NVS_NAMESPACE, false);
+}
+
+/** With NVS empty the RS485 loader gives Modbus RTU on the SP3485 pins. */
+void test_rs485_loader_defaults() {
+  prefs.end();
+  Rs485NodeConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadRs485NodeConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(ReaderType::ModbusRtu), static_cast<uint8_t>(cfg.readerType));
+  TEST_ASSERT_EQUAL_UINT8(6, cfg.espNow.channel);
+  TEST_ASSERT_EQUAL_UINT32(100, cfg.espNow.sendTimeoutMs);
+  TEST_ASSERT_EQUAL_UINT8(1, cfg.modbus.bus.rx);
+  TEST_ASSERT_EQUAL_UINT8(9, cfg.modbus.bus.tx);
+  TEST_ASSERT_EQUAL_UINT8(10, cfg.modbus.bus.dere);
+  TEST_ASSERT_EQUAL_UINT32(9600, cfg.modbus.bus.baudRate);
+  TEST_ASSERT_EQUAL_UINT8(1, cfg.modbus.slaveAddress);
+  TEST_ASSERT_EQUAL_UINT32(1000, cfg.modbus.pollIntervalMs);
+  TEST_ASSERT_EQUAL_UINT8(16, cfg.dlms.clientSap);
+  TEST_ASSERT_EQUAL_UINT16(1, cfg.dlms.serverLogical);
+  TEST_ASSERT_EQUAL_UINT8(1, cfg.dlms.serverAddrLen);
+}
+
+/** Every RS485 key set in NVS overrides its default. */
+void test_rs485_loader_reads_nvs() {
+  prefs.putUInt("reader", static_cast<uint32_t>(ReaderType::DlmsCosem));
+  prefs.putUInt("espnow_chan", 11);
+  prefs.putUInt("baud", 19200);
+  prefs.putUInt("slave_addr", 7);
+  prefs.putUInt("poll_ms", 30000);
+  prefs.putUInt("dlms_client", 32);
+  prefs.end();
+  Rs485NodeConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadRs485NodeConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(ReaderType::DlmsCosem), static_cast<uint8_t>(cfg.readerType));
+  TEST_ASSERT_EQUAL_UINT8(11, cfg.espNow.channel);
+  TEST_ASSERT_EQUAL_UINT32(19200, cfg.modbus.bus.baudRate);
+  TEST_ASSERT_EQUAL_UINT32(19200, cfg.dlms.bus.baudRate);
+  TEST_ASSERT_EQUAL_UINT8(7, cfg.modbus.slaveAddress);
+  TEST_ASSERT_EQUAL_UINT32(30000, cfg.modbus.pollIntervalMs);
+  TEST_ASSERT_EQUAL_UINT8(32, cfg.dlms.clientSap);
+}
+
+/** With NVS empty the IR loader gives the simulated head at 300 baud 7E1, not inverted. */
+void test_ir_loader_defaults() {
+  prefs.end();
+  IrNodeConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadIrNodeConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(IrHeadMode::Simulated), static_cast<uint8_t>(cfg.headMode));
+  TEST_ASSERT_EQUAL_UINT8(6, cfg.espNow.channel);
+  TEST_ASSERT_EQUAL_UINT32(60000, cfg.iec.pollIntervalMs);
+  TEST_ASSERT_EQUAL_UINT8(20, cfg.iec.bus.rx);
+  TEST_ASSERT_EQUAL_UINT8(21, cfg.iec.bus.tx);
+  TEST_ASSERT_EQUAL_UINT32(300, cfg.iec.bus.baudRate);
+  TEST_ASSERT_EQUAL_UINT32(SERIAL_7E1, cfg.iec.bus.format);
+  TEST_ASSERT_FALSE(cfg.iec.bus.txInvert);
+  TEST_ASSERT_FALSE(cfg.iec.bus.rxInvert);
+  TEST_ASSERT_EQUAL_UINT16(5021, cfg.tcp.port);
+}
+
+/** Every IR key set in NVS overrides its default. */
+void test_ir_loader_reads_nvs() {
+  prefs.putUInt("simulate", static_cast<uint32_t>(IrHeadMode::Real));
+  prefs.putUInt("espnow_chan", 11);
+  prefs.putUInt("poll_ms", 15000);
+  prefs.putUInt("ir_tx_inv", 1);
+  prefs.putUInt("ir_rx_inv", 1);
+  prefs.end();
+  IrNodeConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadIrNodeConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(IrHeadMode::Real), static_cast<uint8_t>(cfg.headMode));
+  TEST_ASSERT_EQUAL_UINT8(11, cfg.espNow.channel);
+  TEST_ASSERT_EQUAL_UINT32(15000, cfg.iec.pollIntervalMs);
+  TEST_ASSERT_TRUE(cfg.iec.bus.txInvert);
+  TEST_ASSERT_TRUE(cfg.iec.bus.rxInvert);
+}
+
+/** With NVS empty the CV loader gives the secrets.h camera, the /json path and a DHCP pool starting at .100. */
+void test_cv_loader_defaults() {
+  prefs.end();
+  CvNodeConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadCvNodeConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_EQUAL_UINT8(1, cfg.espNow.channel);
+  TEST_ASSERT_EQUAL_UINT32(200, cfg.espNow.sendTimeoutMs);
+  TEST_ASSERT_EQUAL_UINT32(30000, cfg.cam.pollIntervalMs);
+  TEST_ASSERT_EQUAL_STRING(SECRET_CAM_HOST, cfg.cam.host);
+  TEST_ASSERT_EQUAL_STRING("/json", cfg.cam.path);
+  TEST_ASSERT_EQUAL_STRING(SECRET_CAM_FLOW_NAME, cfg.cam.flowName);
+  TEST_ASSERT_EQUAL_STRING(SECRET_CAM_EXPORT_FLOW_NAME, cfg.cam.exportFlowName);
+  TEST_ASSERT_EQUAL_UINT8(100, cfg.ap.dhcpStart);
+}
+
+/** Every CV key set in NVS overrides its default. */
+void test_cv_loader_reads_nvs() {
+  prefs.putUInt("espnow_chan", 11);
+  prefs.putUInt("poll_ms", 10000);
+  prefs.putString("cam_host", "10.0.0.5");
+  prefs.putString("cam_flow", "meter");
+  prefs.putString("cam_flow_exp", "export");
+  prefs.end();
+  CvNodeConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadCvNodeConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_EQUAL_UINT8(11, cfg.espNow.channel);
+  TEST_ASSERT_EQUAL_UINT32(10000, cfg.cam.pollIntervalMs);
+  TEST_ASSERT_EQUAL_STRING("10.0.0.5", cfg.cam.host);
+  TEST_ASSERT_EQUAL_STRING("meter", cfg.cam.flowName);
+  TEST_ASSERT_EQUAL_STRING("export", cfg.cam.exportFlowName);
+}
+
+/** With NVS empty the gateway loader enables TLS MQTT to the secrets.h broker, with 3 LoRa tries of 1500 ms. */
+void test_gateway_loader_defaults() {
+  prefs.end();
+  GatewayConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadGatewayConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_TRUE(cfg.mqtt.enabled);
+  TEST_ASSERT_EQUAL_STRING(SECRET_MQTT_SERVER, cfg.mqtt.server);
+  TEST_ASSERT_EQUAL_UINT16(SECRET_MQTT_PORT, cfg.mqtt.port);
+  TEST_ASSERT_EQUAL_STRING(SECRET_MQTT_TOPIC, cfg.mqtt.topic);
+  TEST_ASSERT_EQUAL_STRING(SECRET_WIFI_SSID, cfg.wifi.ssid);
+  TEST_ASSERT_EQUAL_UINT8(3, cfg.link.maxRetries);
+  TEST_ASSERT_EQUAL_UINT32(1500, cfg.link.ackTimeoutMs);
+}
+
+/** Every gateway key set in NVS overrides its default, including turning MQTT off. */
+void test_gateway_loader_reads_nvs() {
+  prefs.putUInt("mqtt_on", 0);
+  prefs.putString("mqtt_host", "abc123.s1.eu.hivemq.cloud");
+  prefs.putUInt("mqtt_port", 8884);
+  prefs.putString("mqtt_topic", "kaizen/test");
+  prefs.putString("wifi_ssid", "Bench");
+  prefs.putUInt("lora_retries", 5);
+  prefs.putUInt("lora_ack_ms", 2500);
+  prefs.end();
+  GatewayConfig cfg;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadGatewayConfig(cfg));
+  prefs.begin(NVS_NAMESPACE, false);
+
+  TEST_ASSERT_FALSE(cfg.mqtt.enabled);
+  TEST_ASSERT_EQUAL_STRING("abc123.s1.eu.hivemq.cloud", cfg.mqtt.server);
+  TEST_ASSERT_EQUAL_UINT16(8884, cfg.mqtt.port);
+  TEST_ASSERT_EQUAL_STRING("kaizen/test", cfg.mqtt.topic);
+  TEST_ASSERT_EQUAL_STRING("Bench", cfg.wifi.ssid);
+  TEST_ASSERT_EQUAL_UINT8(5, cfg.link.maxRetries);
+  TEST_ASSERT_EQUAL_UINT32(2500, cfg.link.ackTimeoutMs);
+}
+
+/** On a fresh board the counter starts at 1, and each value is saved. */
+void test_seq_starts_at_one_and_saves() {
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, seqCounterBegin());
+  TEST_ASSERT_EQUAL_UINT32(1, seqNext());
+  TEST_ASSERT_EQUAL_UINT32(2, seqNext());
+  TEST_ASSERT_EQUAL_UINT32(2, storedSeq());
+}
+
+/** Reloading picks up the value stored in NVS, as after a reboot. */
+void test_seq_resumes_from_nvs() {
+  storeSeq(41);
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, seqCounterBegin());
+  TEST_ASSERT_EQUAL_UINT32(42, seqNext());
+  TEST_ASSERT_EQUAL_UINT32(42, storedSeq());
+}
+
+/**
+ * On a never written partition every loader still succeeds with its defaults.
+ *
+ * The "config" namespace does not exist yet, so a read only open of it fails.
+ * The loaders must not mistake that for NVS being unavailable, or no fresh
+ * board would ever start.
+ */
+void test_loaders_succeed_on_fresh_partition() {
+  prefs.end();
+  TEST_ASSERT_EQUAL_INT(ESP_OK, nvs_flash_erase());
+  TEST_ASSERT_EQUAL_INT(ESP_OK, nvs_flash_init());
+
+  Preferences readOnly;
+  TEST_ASSERT_FALSE(readOnly.begin(NVS_NAMESPACE, true));
+
+  Rs485NodeConfig rs485;
+  IrNodeConfig ir;
+  CvNodeConfig cv;
+  SubstationConfig substation;
+  GatewayConfig gateway;
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadRs485NodeConfig(rs485));
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadIrNodeConfig(ir));
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadCvNodeConfig(cv));
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadSubstationConfig(substation));
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, loadGatewayConfig(gateway));
+  TEST_ASSERT_EQUAL_UINT32(1000, rs485.modbus.pollIntervalMs);
+  TEST_ASSERT_EQUAL_UINT8(6, substation.espNowChannel);
+
+  prefs.begin(NVS_NAMESPACE, false);
+}
+
+/** With NVS unavailable every loader fails and leaves its config untouched. */
+void test_loaders_fail_without_nvs() {
+  Rs485NodeConfig rs485;
+  IrNodeConfig ir;
+  CvNodeConfig cv;
+  SubstationConfig substation;
+  GatewayConfig gateway;
+  substation.espNowChannel = 99;
+
+  nvsDown();
+  int rs485Result = loadRs485NodeConfig(rs485);
+  int irResult = loadIrNodeConfig(ir);
+  int cvResult = loadCvNodeConfig(cv);
+  int substationResult = loadSubstationConfig(substation);
+  int gatewayResult = loadGatewayConfig(gateway);
+  nvsUp();
+
+  TEST_ASSERT_EQUAL_INT(EXIT_FAILURE, rs485Result);
+  TEST_ASSERT_EQUAL_INT(EXIT_FAILURE, irResult);
+  TEST_ASSERT_EQUAL_INT(EXIT_FAILURE, cvResult);
+  TEST_ASSERT_EQUAL_INT(EXIT_FAILURE, substationResult);
+  TEST_ASSERT_EQUAL_INT(EXIT_FAILURE, gatewayResult);
+  TEST_ASSERT_EQUAL_UINT8(99, substation.espNowChannel);
+}
+
+/** With NVS unavailable the sequence counter fails, and works again once NVS is back. */
+void test_seq_fails_without_nvs() {
+  storeSeq(41);
+
+  nvsDown();
+  int downResult = seqCounterBegin();
+  nvsUp();
+
+  TEST_ASSERT_EQUAL_INT(EXIT_FAILURE, downResult);
+  TEST_ASSERT_EQUAL_INT(EXIT_SUCCESS, seqCounterBegin());
+  TEST_ASSERT_EQUAL_UINT32(42, seqNext());
+}
+
+/** @} */
+
+/** Runs every test once the serial port is up. */
+void setup() {
+  delay(500);
+  UNITY_BEGIN();
+  RUN_TEST(test_read_u32_written_key);
+  RUN_TEST(test_read_u32_unset_key_gives_default);
+  RUN_TEST(test_read_str_written_key);
+  RUN_TEST(test_read_str_unset_key_gives_default);
+  RUN_TEST(test_read_str_truncates);
+  RUN_TEST(test_substation_loader_reads_nvs);
+  RUN_TEST(test_rs485_loader_defaults);
+  RUN_TEST(test_rs485_loader_reads_nvs);
+  RUN_TEST(test_ir_loader_defaults);
+  RUN_TEST(test_ir_loader_reads_nvs);
+  RUN_TEST(test_cv_loader_defaults);
+  RUN_TEST(test_cv_loader_reads_nvs);
+  RUN_TEST(test_gateway_loader_defaults);
+  RUN_TEST(test_gateway_loader_reads_nvs);
+  RUN_TEST(test_seq_starts_at_one_and_saves);
+  RUN_TEST(test_seq_resumes_from_nvs);
+  RUN_TEST(test_loaders_succeed_on_fresh_partition);
+  RUN_TEST(test_loaders_fail_without_nvs);
+  RUN_TEST(test_seq_fails_without_nvs);
+  UNITY_END();
+}
+
+/** Unused, every test runs in setup(). */
+void loop() {}
