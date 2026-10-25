@@ -1,0 +1,190 @@
+# NVS config keys
+
+Keys stored in the `"config"` NVS namespace (the `*_loader.cpp` files), settable at
+runtime over serial with `set <key> <value>` (see `nvsConfigPollSerial`).
+Unset keys fall back to the default shown below (usually from `secrets.h`).
+
+There is no enum or central table enforcing these in code — this file is the
+source of truth. If a loader changes, update this file in
+the same commit.
+
+Max key length: 15 characters (`NVS_MAX_KEY_LEN`).
+
+Value type sent over serial:
+- `set key 123` → stored as uint (`putUInt`)
+- `set key "text"` → stored as string (`putString`)
+
+It must match how the key is read back (`readU32` vs `readStr`),
+or the value will be written but silently unused / misread.
+
+## Shared (LoRa: substation + gateway)
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `lora_band` | uint | `SECRET_LORA_BAND` | Radio frequency band |
+| `lora_sf` | uint | `10` | Spreading factor |
+| `lora_bw` | uint | `125000` | Bandwidth (Hz) |
+| `lora_sync` | uint | `0xF3` | Sync word |
+| `lora_txpwr` | uint | `14` | TX power |
+| `lora_retries` | uint | `3` | Max link-layer retries |
+| `lora_ack_ms` | uint | `1500` | ACK timeout (ms) |
+
+## Rs485 node (`loadRs485NodeConfig`)
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `comm_id` | uint | `0` | Community code (goes out in the payload) |
+| `unit_id` | uint | `0` | Unit code (goes out in the payload) |
+| `reader` | uint | `ReaderType::ModbusRtu` | Reader backend, `0` Modbus RTU, `3` Modbus TCP, `5` DLMS/COSEM, `6` DLMS/COSEM over TCP |
+| `ap_ssid` | string | `SECRET_AP_SSID` | SoftAP SSID (ModbusTCP and DlmsTcp modes only) |
+| `ap_pass` | string | `SECRET_AP_PASS` | SoftAP password (ModbusTCP and DlmsTcp modes only) |
+| `espnow_chan` | uint | `6` | Radio channel, shared by ESP-NOW and the softAP |
+| `espnow_to_ms` | uint | `100` | ESP-NOW send timeout (ms) |
+| `meter_model` | uint | `MeterModel::Simulated_Tcp` | Meter model (selects registers) |
+| `poll_ms` | uint | `1000` | Meter poll interval (ms) |
+| `baud` | uint | `9600` | RS485 baud rate, Modbus RTU and DLMS/COSEM |
+| `slave_addr` | uint | `1` | Modbus slave address |
+| `dlms_client` | uint | `16` | DLMS client SAP, 16 is the public client |
+| `dlms_logical` | uint | `1` | DLMS server logical device, 1 is the management device |
+| `dlms_physical` | uint | `0` | DLMS server physical address on the bus |
+| `dlms_addr_len` | uint | `1` | DLMS server address size in bytes, `1`, `2` or `4` |
+| `tcp_host` | string | `SECRET_MODBUS_SIM_HOST` | TCP simulator host, ModbusSim or DlmsSim |
+| `tcp_port` | uint | `SECRET_MODBUS_SIM_PORT` | TCP simulator port, set `5022` for `DlmsSim/DlmsSimTCP.py` |
+
+The DLMS/COSEM OBIS codes are not NVS keys. They are the `DLMS_IMPORT_OBIS`,
+`DLMS_EXPORT_OBIS` and `DLMS_VOLTAGE_OBIS` constants in `rs485_loader.cpp`,
+1.0.1.8.0.255, 1.0.2.8.0.255 and 1.0.32.7.0.255.
+
+## CV (camera) node (`loadCvNodeConfig`)
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `comm_id` | uint | `0` | Community code (goes out in the payload) |
+| `unit_id` | uint | `0` | Unit code (goes out in the payload) |
+| `ap_ssid` | string | `SECRET_CAM_AP_SSID` | SoftAP SSID the cam joins |
+| `ap_pass` | string | `SECRET_CAM_AP_PASSWORD` | SoftAP password |
+| `espnow_chan` | uint | `1` | Radio channel, shared by ESP-NOW and the softAP |
+| `espnow_to_ms` | uint | `200` | ESP-NOW send timeout (ms) |
+| `poll_ms` | uint | `30000` | Camera poll interval (ms) |
+| `cam_user` | string | `SECRET_CAM_USER` | Camera HTTP basic auth user |
+| `cam_pass` | string | `SECRET_CAM_PASS` | Camera HTTP basic auth password |
+| `cam_host` | string | `SECRET_CAM_HOST` | Camera host |
+| `cam_flow` | string | `SECRET_CAM_FLOW_NAME` | Camera flow (number) name of the import reading |
+| `cam_flow_exp` | string | `SECRET_CAM_EXPORT_FLOW_NAME` | Camera flow name of the export reading. Empty (the default) means the cam reads import only and export goes out as 0 |
+
+Note: `ap_ssid`, `ap_pass`, `espnow_chan`, `espnow_to_ms`,
+`poll_ms`, `comm_id`, and `unit_id` are reused key names between the Rs485 and CV loaders, each with
+their own defaults. This is fine as long as a given board only ever runs one
+node type's firmware image against its NVS namespace.
+
+## IR node (`loadIrNodeConfig`)
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `comm_id` | uint | `0` | Community code (goes out in the payload) |
+| `unit_id` | uint | `0` | Unit code (goes out in the payload) |
+| `simulate` | uint | `1` | `IrHeadMode`: `0` = `RealIrHead` (UART pins), `1` = `SimulatedIrHead` (canned replies), `2` = `TcpIrHead` (`IrSim/IrSimTCP.py` over WiFi) |
+| `ap_ssid` | string | `SECRET_AP_SSID` | SoftAP SSID (`simulate 2` only) |
+| `ap_pass` | string | `SECRET_AP_PASS` | SoftAP password (`simulate 2` only) |
+| `espnow_chan` | uint | `6` | ESP-NOW channel |
+| `espnow_to_ms` | uint | `100` | ESP-NOW send timeout (ms) |
+| `poll_ms` | uint | `60000` | Meter poll interval (ms) |
+| `tcp_host` | string | `SECRET_MODBUS_SIM_HOST` | IR simulator host (`simulate 2` only) |
+| `tcp_port` | uint | `5021` | IR simulator port (`simulate 2` only) |
+| `ir_tx_inv` | uint (bool) | `0` | Invert the IR UART's TX. `0` for the PiggyMeter head (LED on when LOW) and a USB-serial adapter, `1` for a head whose LED is on when HIGH |
+| `ir_rx_inv` | uint (bool) | `0` | Invert the IR UART's RX. `0` for the PiggyMeter head (RX goes LOW with light) and a USB-serial adapter, `1` for a head that reads light ON as HIGH |
+
+Note: the optical port's bus pins, baud rate (300) and framing (7E1) are
+hardcoded in `loadIrNodeConfig()`, not NVS keys -- the starting baud and
+framing are mandated by IEC 62056-21 itself, not a per-meter choice the
+way RS485's `baud` key is.
+
+## Gateway node (`loadGatewayConfig`)
+
+Also loads the shared LoRa keys above, plus:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `wifi_ssid` | string | `SECRET_WIFI_SSID` | WiFi SSID |
+| `wifi_pass` | string | `SECRET_WIFI_PASS` | WiFi password |
+| `mqtt_on` | uint (bool) | `1` | MQTT enabled (`0`/`1`) |
+| `mqtt_host` | string | `SECRET_MQTT_SERVER` | MQTT broker host |
+| `mqtt_port` | uint | `SECRET_MQTT_PORT` | MQTT broker port |
+| `mqtt_topic` | string | `SECRET_MQTT_TOPIC` | MQTT topic |
+| `mqtt_user` | string | `SECRET_MQTT_USERNAME` | MQTT username |
+| `mqtt_pass` | string | `SECRET_MQTT_PASSWORD` | MQTT password |
+
+## Substation node (`loadSubstationConfig`)
+
+The shared LoRa keys above, plus:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `espnow_chan` | uint | `6` | WiFi channel ESP-NOW beacons and listens on, must match the sending node's `espnow_chan` |
+| `espnow_to_ms` | uint | `100` | How long a beacon or JoinAck send waits for the radio (ms) |
+
+End nodes have no substation address key. They find the substation from its
+beacon and join it at boot, see `SubstationLink`.
+
+## Runtime namespace (`seq_counter.cpp`)
+
+Not config. These keys live in the `"runtime"` namespace, are written by the
+device itself, and are not meant to be set by a dev. `clear` only wipes
+`"config"`, so it leaves these alone.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `seq` | uint | `0` | Last sequence number handed out, persisted before each send so it never repeats across reboots |
+
+## Serial commands
+
+| Command | Effect |
+|---|---|
+| `set <key> <value>` | Write a key (uint, or `"quoted string"`) |
+| `clear` | Wipe the whole `"config"` namespace |
+| `reboot` | Restart the device (needed to apply changes) |
+
+### How to run them
+
+Commands are read by `nvsConfigPollSerial()`, which must be polled from each
+node's `loop()`. It buffers incoming serial bytes (64 char max) and hands a
+full line to `processLine()` as soon as it sees `\n` or `\r`.
+
+To send commands:
+
+1. Open a serial monitor on the device's port (PlatformIO: `pio device
+   monitor`, or the Arduino IDE serial monitor) at the node's configured baud
+   rate.
+2. Set the monitor's line ending to send `\n` or `\r` (most monitors do this
+   by default when you press Enter).
+3. Type a command and send it. The device replies with a `[CFG] ...` line.
+
+Value quoting (matters for whether a value is stored as a string vs a uint,
+see the type table above):
+
+- `set <key> 123` → parsed with `strtoul` and stored with `putUInt`. Anything
+  that doesn't start with `"` is treated this way, including garbage, which
+  will just save as `0`.
+- `set <key> "some text"` → the value must start and end with `"`, stored
+  with `putString` (quotes stripped). A missing or malformed closing quote
+  is rejected with `[CFG] malformed quoted value`.
+
+Example session:
+
+```
+> set wifi_ssid "myssid"
+[CFG] saved, reboot to apply
+> set mqtt_port 1883
+[CFG] saved, reboot to apply
+> reboot
+```
+
+Notes:
+
+- `set` with a key over 15 chars (`NVS_MAX_KEY_LEN`) is rejected.
+- `set` with a missing key or value prints `[CFG] usage: set <key> <value>`.
+- Nothing you `set` takes effect until `reboot`, since config is only loaded
+  once at startup (see each `load*Config` function).
+- `clear` wipes the whole `"config"` namespace in one go; there's no per-key
+  delete command.
+- Unrecognized commands print `[CFG] unknown command`.

@@ -1,163 +1,342 @@
-# NEXTGEN IEMS
+# Focault Dynamics IoT Firmware
+Firmware for the Focault Dynamics IoT metering network, a QUT capstone project.
+The repository began as a fork of [NEXTGEN_IEMS](https://github.com/kahoQUT/NEXTGEN_IEMS).
+The goal of this repository is to move every node onto the
+ESP32-C3 SuperMini and give each one a swappable meter-reading module (RS485,
+IR optical head, or camera) chosen by its role in the network.
 
-NEXTGEN IEMS is an ESP32/PlatformIO prototype for a fault-tolerant intelligent energy metering system. It simulates energy meter readings on an ESP32-C3 SuperMini, sends the readings to a LilyGo substation using ESP-NOW, relays the payload over LoRa, and forwards the received data to an MQTT broker from the gateway.
+## Documentation
+
+New to the codebase? Start with [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md),
+which covers installing, flashing, a first end to end run, testing, and how the
+code in `src/` flows. Setting up the CV node and its camera is in
+[`docs/CV_GETTING_STARTED.md`](docs/CV_GETTING_STARTED.md).
+
+API docs for every class, function and config struct are published at
+**https://foucault-dynamics.github.io/IoT-Firmware/**, rebuilt from the code on
+every push to `main`. The commenting rules the site is built from are in
+[`docs/COMMENTING.md`](docs/COMMENTING.md). How to run and write the unit
+tests is in [`docs/TESTING.md`](docs/TESTING.md). To build the docs locally:
+
+```sh
+brew install doxygen graphviz
+doxygen
+open build/docs/index.html
+```
 
 ## System Overview
 
-```text
-ESP32-C3 SuperMini meter node
-        |
-        | ESP-NOW
-        v
-LilyGo substation / relay
-        |
-        | LoRa
-        v
-LilyGo gateway
-        |
-        | MQTT
-        v
-MQTT broker
+```mermaid
+flowchart TD
+    subgraph rs485["RS485 node (ESP32-C3)"]
+        direction TB
+        A["Sp3485 (Module)"] --> R1["ModbusRtuReader"]
+        B["TcpBus (Module)"] --> R1
+        A --> R4["DlmsCosemReader"]
+        B --> R4
+    end
+
+    subgraph ir["IR node (ESP32-C3)"]
+        direction TB
+        C["RealIrHead (Module)"] --> R2["Iec6205621Reader"]
+        D["SimulatedIrHead (Module)"] --> R2
+        T["TcpIrHead (Module)"] --> R2
+    end
+
+    subgraph cv["CV node (ESP32-C3)"]
+        direction TB
+        E["HttpBus (Module)"] --> R3["CamHttpReader"]
+    end
+
+    rs485 -->|"ESP-NOW"| S["Substation / relay"]
+    ir -->|"ESP-NOW"| S
+    cv -->|"ESP-NOW"| S
+    S -->|"LoRa (ACK + retry)"| G["Gateway"]
+    G -->|"MQTT (JSON)"| M["MQTT broker"]
+
+    classDef working fill:#d4edda,stroke:#28a745,color:#000
+    classDef untested fill:#fff3cd,stroke:#e0a800,color:#000
+
+    class A,B,R1,R4,D,T,R2,E,R3,S,G,M working
+    class C untested
 ```
 
-## Features
+| Colour | Meaning |
+|---|---|
+| Green | Works (RS485 path tested, CV path run on an ESP32-CAM and C3 SuperMini, the IR readers tested over TCP against their simulators, ESP-NOW, LoRa and MQTT working) |
+| Yellow | Untested on hardware (Real IR head) |
 
-- Simulated meter readings for import kWh, export kWh, voltage and battery voltage.
-- ESP-NOW communication from the SuperMini node to the LilyGo substation.
-- RTC memory buffering on the SuperMini for unsent records.
-- LoRa relay with acknowledgement handling and retry logic.
-- MQTT publishing from the gateway.
-- OLED status display on LilyGo devices.
+## Architecture
 
-## Hardware
+All reusable code lives in `lib/`, split into seven groups. `src/` holds the firmware itself: one entry file
+per PCB picks a node role, and `src/nodes/` assembles that node from the libraries.
 
-- ESP32-C3 SuperMini
-- LilyGo / ESP32 LoRa OLED board as the substation relay
-- LilyGo / ESP32 LoRa OLED board as the gateway
-- LoRa antennas
-- MQTT broker
+### Lib directory
 
-## Project Structure
+The lib directory contains all code for which the main loop and setup depends inside of `src`
+
+| Folder | Role | Terminology |
+|---|---|---|
+| `lib/interfaces/` | Abstract base classes and the shared packet format | |
+| `lib/config/` | Shape of each node's settings, how they are loaded, and NVS configuration | |
+| `lib/buses/` | Physical hardware that moves raw bytes | **Modules** |
+| `lib/protocols/` | Meter protocols that turn bytes into values | **Readers** |
+| `lib/links/` | The radio, and what sits on top of it | **Transmitters** |
+| `lib/buffering/` | Buffering of the substation | |
+| `lib/bringup/` | The bring up checks and meter readiness gate every end node shares | |
+
+Three abstractions sit at the centre. A node is assembled by picking one of
+each. The definitions live in `lib/interfaces/`, and every implementation in the
+other groups derives from one of them.
+
+| Layer | Folder | Header | Responsibility |
+|---|---|---|---|
+| `Module` | `lib/interfaces/module/` | `module.h` | Moves raw bytes over one physical bus. Knows its pins and its peripheral, knows nothing about meaning. `init()`, `send()`, `readByte()`, `available()`. |
+| `Reader` | `lib/interfaces/reader/` | `reader.h` | Speaks a meter protocol on top of a `Module&`. Turns registers into values. `init(Module&)`, `probe()`, `get_import()`, `get_export()`, `get_voltage()`. |
+| `Transmitter` | `lib/interfaces/transmitter/` | `transmitter.h` | Moves whole packets to a peer address. `init()`, `sendPacket()`, `receivePacket()`. |
+
+A `Reader` holds a `Module&` and is stacked on top of it. `Module` and
+`Transmitter` are siblings: a meter node holds a `Module` facing the meter and a
+`Transmitter` facing the substation.
+
+### Configuration
+
+Configuration is a plain struct per node role, defined in `lib/config/node_config/`
+(for example `rs485_config.h`, `gateway_config.h`). The structs hold shapes only.
+Firmware defaults for every field live in `lib/config/secrets/`. Each concrete
+reader, module or Transmitter takes its config in its own constructor, which keeps every protocol's
+fields out of the shared base interface.
+
+### NVS
+
+`lib/config/nvs_config/` has one loader per node, which fills that node's config
+struct. Each field is read from NVS if it was ever set, and otherwise falls back
+to the firmware default from `lib/config/secrets/`. The loaders are the seam
+where upstream configuration selection will replace the defaults later without
+touching any call site **(FUTURE IMPLEMENTATION)**.
+
+### Role dispatch
+
+Each PCB gets its own firmware image, so the build decides which PCB a board is
+and `readModuleType()` only picks a role within that PCB.
+
+- `src/end_node_main.cpp` picks RS485, IR or CV. `readModuleType()` currently asks
+  over serial, and is meant to be replaced by driving current to `GPIO3` and reading the
+  voltage difference over `GPIO4` **(FUTURE IMPLEMENTATION WHEN FINAL PCB AVAILABLE)**.
+- `src/lora_main.cpp` picks substation or gateway. `readModuleType()` currently asks
+  over serial, and will read whatever ID mechanism the hardware team puts on the LoRa PCB
+  **(FUTURE IMPLEMENTATION)**.
+
+### Basic flow
+
+Flow begins in the PCB's entry file where the serial monitor is prompted to choose a given module
+(Replaced with the Role Dispatch in the future). Based on the module type the given setup is called in `src/nodes`,
+and subsequently its respective loop. At the beginning of each loop, the serial buffer is parsed for any NVS configuration
+to be set (more information in the NVS subfolder README).
+
+Every end node's setup builds its bus and reader and hands them to `endNodeBringUp()`, which checks NVS, the AP when
+there is one, the bus, the reader and ESP-NOW in one fixed order and idles the node on the first failure. A `MeterGate`
+then keeps the node not ready until the meter answers the reader's `probe()`, prints `[TAG] Ready`, and drops back to
+not ready after 3 failed reads in a row. See `lib/README.md` and [Getting started](docs/GETTING_STARTED.md#gs_flow).
+
+
+## Repository Layout
 
 ```text
-NEXTGEN_IEMS/
-├── include/
-│   └── SharedPayload.h
+Project_Kaizen/
+├── lib/
+│   ├── interfaces/
+│   │   ├── module/          Module base class
+│   │   ├── reader/          Reader base class
+│   │   ├── transmitter/     Transmitter base class
+│   │   └── shared/          shared_payload.h
+│   ├── config/
+│   │   ├── node_config/     Per-node config structs
+│   │   ├── nvs_config/      NVS loaders filling the config structs
+│   │   └── secrets/         secrets.h
+│   ├── buses/
+│   │   ├── bus_checks/      Pin, UART start and loopback checks
+│   │   ├── sp3485/          RS485 transceiver Module
+│   │   ├── http_bus/        HTTP client Module for the ESP32-CAM
+│   │   ├── tcp_bus/         RTU-over-TCP Module
+│   │   ├── lora/            SX1276 radio Module
+│   │   └── ir_head/         Optical probe Module
+│   ├── protocols/
+│   │   ├── modbus_rtu/      Modbus RTU Reader
+│   │   ├── dlms_cosem/      DLMS/COSEM Reader over HDLC
+│   │   ├── cam_http/        ESP32-CAM Reader
+│   │   ├── payload_json/    Gateway's MQTT JSON
+│   │   └── iec62056_21/     IEC 62056-21 optical protocol
+│   ├── links/
+│   │   ├── esp_now_uplink/  ESP-NOW Transmitter
+│   │   ├── substation_link/ Substation discovery and join
+│   │   ├── lora_link/       LoRa Transmitter with ACKs
+│   │   └── wifi_radio/      Radio mode, channel and softAP
+│   ├── buffering/
+│   │   ├── seq_counter/     Persistent reading sequence number
+│   │   └── reading_buffer/  Substation store and forward buffer
+│   └── bringup/
+│       └── end_node_bringup/ End node bring up and MeterGate
 ├── src/
-│   ├── main-esp-now-supermini.cpp
-│   ├── main-esp-now-lilyGo.cpp
-│   ├── main-esp-now-gateway.cpp
-│   └── secrets.h
+│   ├── end_node_main.cpp              end node role dispatch
+│   ├── lora_main.cpp                  LoRa PCB role dispatch
+│   └── nodes/
+│       ├── nodes.h
+│       ├── rs485_node.cpp
+│       ├── substation.cpp
+│       ├── gateway.cpp
+│       ├── ir_node.cpp
+│       └── cv_node.cpp
+├── ModbusSim/
+│   ├── ModbusSimSerial.py
+│   ├── ModbusSimTCP.py
+│   ├── poll_test.py
+│   └── README.md
+├── IrSim/
+│   ├── IrSimSerial.py
+│   ├── IrSimTCP.py
+│   ├── ir_poll_test.py
+│   ├── native/
+│   └── README.md
+├── DlmsSim/
+│   ├── dlms_meter.py
+│   ├── DlmsSimSerial.py
+│   ├── DlmsSimTCP.py
+│   ├── dlms_poll_test.py
+│   └── README.md
+├── docs/
+│   ├── GETTING_STARTED.md
+│   ├── CV_GETTING_STARTED.md
+│   ├── COMMENTING.md
+│   └── TESTING.md
+├── test/
+│   ├── support/             FakeBus, shared by the driver tests
+│   ├── test_qemu_*/         unit tests run in QEMU
+│   └── test_board_*/        tests that need a real C3
+├── tools/
+│   ├── setup_qemu.sh        downloads Espressif's QEMU
+│   └── qemu_test.py         runs a test build in QEMU
 ├── platformio.ini
 └── README.md
 ```
 
 ## PlatformIO Environments
 
-| Environment | Device | Purpose |
+Each firmware environment builds one PCB's image: its entry file plus only the
+nodes that PCB runs. `test_c3` builds the unit tests instead, see
+[`docs/TESTING.md`](docs/TESTING.md).
+
+| Environment | Board | Use |
 |---|---|---|
-| `supermini` | ESP32-C3 SuperMini | Simulates meter readings and sends them by ESP-NOW. |
-| `lilygo` | LilyGo / ESP32 LoRa OLED board | Receives ESP-NOW packets and relays them by LoRa. |
-| `gateway` | LilyGo / ESP32 LoRa OLED board | Receives LoRa packets, sends ACKs and publishes data to MQTT. |
+| `end_node` (default) | `esp32-c3-devkitm-1` | **Builds.** The end node image, `end_node_main.cpp` with the RS485, IR and CV nodes. |
+| `lilygo_lora` | `ttgo-lora32-v21` | **Builds.** The LoRa PCB image, `lora_main.cpp` with the substation and gateway nodes, on the LilyGo LoRa board. |
+| `lora_c3` | `esp32-c3-devkitm-1` | **Builds.** The same LoRa PCB image on an ESP32-C3 SuperMini wired to an SX1276 breakout. |
+| `test_c3` | `esp32-c3-devkitm-1` | Unit tests in emulated ESP32-C3, `pio test -e test_c3 --without-uploading`. |
 
-## `secrets.h` Configuration
+`lora_c3` picks its LoRa pins in `lib/config/nvs_config/lora_loader.cpp` through
+`CONFIG_IDF_TARGET_ESP32C3`: SCK 4, MISO 5, MOSI 6, SS 7, RST 3, DIO0 10. These
+are placeholders until the LoRa PCB pinout exists.
 
-The project requires a local configuration file in the `src/` folder:
+**Note**: `end_node` and `lora_c3` set `ARDUINO_USB_MODE` and `ARDUINO_USB_CDC_ON_BOOT` so serial output
+appears over the C3's native USB. `lilygo_lora` does not need them, because that
+board talks to the computer through a USB to UART bridge chip.
 
-```text
-src/secrets.h
-```
+## Hardware
 
-Use the following format and update the values for your own setup:
-
-```cpp
-#pragma once
-
-#define SECRET_MQTT_SERVER "broker.hivemq.com"
-#define SECRET_MQTT_PORT 1883
-#define SECRET_MQTT_TOPIC "your/mqtt/topic"
-
-#define SECRET_MAC {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
-#define SECRET_LORA_BAND 433E6
-```
-
-### Configuration Fields
-
-- `SECRET_MQTT_SERVER`: MQTT broker address.
-- `SECRET_MQTT_PORT`: MQTT broker port. Standard non-TLS MQTT usually uses `1883`.
-- `SECRET_MQTT_TOPIC`: MQTT topic used by the gateway when publishing meter data.
-- `SECRET_MAC`: MAC address of the LilyGo substation relay. Upload the `lilygo` firmware first, open the serial monitor, copy the printed MAC address, then paste it here.
-- `SECRET_LORA_BAND`: LoRa frequency used by both LilyGo devices. Both devices must use the same frequency.
-
-## Build and Upload
-
-### Upload the LilyGo Substation Relay
-
-```bash
-pio run -e lilygo -t upload
-pio device monitor -e lilygo
-```
-
-Copy the MAC address shown in the serial monitor and update `SECRET_MAC` in `src/secrets.h`.
-
-### Upload the LilyGo Gateway
-
-```bash
-pio run -e gateway -t upload
-pio device monitor -e gateway
-```
-
-Confirm that the gateway connects to the MQTT broker.
-
-### Upload the ESP32-C3 SuperMini Meter Node
-
-```bash
-pio run -e supermini -t upload
-pio device monitor -e supermini
-```
-
-The SuperMini will generate simulated meter data, send it by ESP-NOW and then enter deep sleep.
+- ESP32-C3 SuperMini as the meter end-node
+- LilyGo / ESP32 LoRa OLED board as the substation relay and as the gateway,
+  inherited from NEXTGEN_IEMS. The OLED is unused.
+- SX1276 LoRa module and antennas
+- SP3485 RS485 transceiver on the meter node
+- ESP32-CAM running AI-on-the-edge-device, read by the CV node over HTTP
+- An MQTT broker
 
 ## Payload Format
 
-The binary payload is defined in `include/SharedPayload.h`:
+Defined in `lib/interfaces/shared/shared_payload.h`. `Payload` is packed to 35
+bytes and `AckPayload` to 20:
 
 ```cpp
-struct Payload {
-    uint32_t uid;
-    uint32_t seq;
-    float kwh_import;
-    float kwh_export;
-    float voltage;
-    float battery_v;
+#pragma pack(push, 1)
+struct Payload {            // 35 bytes
+    uint8_t uid[UID_LEN];   // 16 byte eFuse UID of the sending node
+    uint32_t seq;           // Per node sequence number, deduplicates retries
+    float kwh_import;       // OBIS 1.8.0
+    float kwh_export;       // OBIS 2.8.0
+    float voltage;          // Grid voltage in volts
     uint8_t community_id;
     uint8_t unit_id;
+    uint8_t node_type;      // NodeType: 0 RS485, 1 CV, 2 IR
 };
 
-struct AckPayload {
-    uint32_t uid;
+struct AckPayload {         // 20 bytes
+    uint8_t uid[UID_LEN];
     uint32_t seq;
 };
+#pragma pack(pop)
 ```
 
-All devices must use the same `SharedPayload.h` structure. If the structure is changed, rebuild and upload all environments again.
+The gateway publishes `node_type` in its MQTT JSON as `"rs485"`, `"cv"` or
+`"ir"`, or `null` for a value it does not recognise.
 
-## Troubleshooting
+The same header also defines `LinkFrame` (23 bytes), the ESP-NOW join handshake
+between a meter node and the substation. It starts with the magic bytes `KZ`.
 
-### ESP-NOW Send Fails
+Every device must use the same structs. The ESP-NOW and LoRa receive paths tell
+frames apart by length and reject any other size (`Payload` and `LinkFrame` on
+ESP-NOW, `Payload` and `AckPayload` on LoRa), so if you change this file,
+rebuild and reflash all environments together.
 
-- Check that `SECRET_MAC` is the LilyGo substation MAC address.
-- Confirm both devices are powered on.
-- Use serial monitor baud rate `115200`.
 
-### LoRa Receive Size Mismatch
+## Modbus Simulator
 
-- Confirm all devices use the same `SharedPayload.h` file.
-- Rebuild and upload all firmware after changing the payload structure.
-- Confirm both LoRa devices use the same `SECRET_LORA_BAND`.
+`ModbusSim/` holds two `pymodbus` servers used to develop the meter-reading side
+without physical hardware. Both expose a three-value register map, voltage at
+address 0, export kWh at 2, import kWh at 4, each a 32-bit big-endian pair, with
+values that change on every poll. These addresses match the
+`MeterModel::Simulated_Serial` and `MeterModel::Simulated_Tcp` rows of
+`METER_MODELS` in `lib/config/nvs_config/rs485_loader.cpp`.
 
-### MQTT Does Not Connect
+- `ModbusSimTCP.py` serves RTU-over-TCP on `0.0.0.0:5020`. This is what
+  `lib/buses/tcp_bus/` talks to.
+- `ModbusSimSerial.py` serves RTU on a serial port. The port is an optional
+  argument and defaults to `/dev/cu.wchusbserial10`.
+- `poll_test.py` is a minimal RTU-over-TCP client that reads all three registers
+  and decodes them, useful for confirming the server before pointing firmware at
+  it.
 
-- Check MQTT server and port.
-- Confirm the broker accepts the connection.
-- Avoid using MQTT wildcard characters such as `+` when publishing to a topic.
+See `ModbusSim/README.md` for venv setup, how to poll with
+`python3 -m pymodbus.console`, and the `socat` null-modem recipe for the serial
+variant.
+
+## IR Simulator
+
+`IrSim/` is the IR counterpart: a fake IEC 62056-21 mode C meter in plain
+Python, with import and export kWh that go up on every read.
+
+- `IrSimTCP.py` serves the optical port's bytes over TCP on `0.0.0.0:5021`. The
+  IR node reaches it through `TcpIrHead` with `set simulate 2`.
+- `IrSimSerial.py` serves them on a serial port at 300 baud 7E1, switching baud
+  rate like a real meter, for testing `RealIrHead` through a USB to serial
+  adapter.
+- `ir_poll_test.py` reads either one the way the firmware does.
+- `native/run.sh` builds the firmware's real `Iec6205621Reader` for the laptop
+  and runs it against fake meters, no board needed.
+
+See `IrSim/README.md` for each way of testing, from laptop only up to the PCB.
+
+## DLMS Simulator
+
+`DlmsSim/` is a fake DLMS/COSEM meter built on the independent
+[Gurux.DLMS.Python](https://github.com/Gurux/Gurux.DLMS.Python) library, so a
+session that works against it shows the firmware's `DlmsCosemReader`
+interoperates with a second implementation of the standard.
+
+- `DlmsSimTCP.py` serves HDLC over TCP on `0.0.0.0:5022`. The RS485 node reaches
+  it through `TcpBus` with `reader = 6`.
+- `DlmsSimSerial.py` serves HDLC on a serial port at 9600 `8N1`. The RS485 node
+  reaches it through the `Sp3485` with `reader = 5`.
+- `dlms_poll_test.py` reads the import, export and voltage Registers from either
+  one with Gurux's client.
+
+See `DlmsSim/README.md` for the register map, setup and the Gurux workarounds.
